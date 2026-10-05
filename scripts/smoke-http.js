@@ -51,8 +51,9 @@ async function runChecks(base) {
 
   console.log('[3] 场景接口 GET /api/scenarios');
   const scn = await request(base, 'GET', '/api/scenarios');
-  check(scn.status === 200 && scn.json && scn.json.missingAcquire && scn.json.completeTransfer,
-    '返回 missingAcquire 与 completeTransfer 两个场景');
+  check(scn.status === 200 && scn.json && scn.json.missingAcquire && scn.json.completeTransfer
+    && scn.json.outOfOrderTargets && scn.json.duplicateTarget,
+    '返回 missingAcquire / completeTransfer / outOfOrderTargets / duplicateTarget 场景');
 
   console.log('[3b] Worker 引擎静态资源 GET /verifier/worker.js');
   const wjs = await request(base, 'GET', '/verifier/worker.js');
@@ -82,6 +83,39 @@ async function runChecks(base) {
     && read.evidence.via && read.evidence.via.kind === 'semaphore',
     '呈现完整移交证据（releaseBy=D1, acquireBy=E1, via=semaphore）');
   check(!!(good.json && good.json.transfers.length === 1), '移交记录 1 段 frameA[0..7]');
+
+  console.log('[6] 乱序目标值 + 跳跃门槛必须通过：校正(C1) → 解码(D1) → 编码(E1)');
+  const ooo = await request(base, 'POST', '/api/verify', scenarios.outOfOrderTargets.input);
+  check(ooo.status === 200, `HTTP 200（实际 ${ooo.status}）`);
+  check(ooo.json && ooo.json.ok === true, 'ok=true');
+  const oooOrder = ooo.json && ooo.json.executableOrder.map((x) => x.id).join(',');
+  check(oooOrder === 'C1,D1,E1', `可执行次序 C1 → D1 → E1（实际 ${oooOrder}）`);
+  const oooRead = ooo.json && ooo.json.affectedRanges.E1.reads[0];
+  check(!!oooRead && oooRead.start === 0 && oooRead.end === 4, '编码读取解码区间 frame[0..3]');
+  check(!!oooRead && oooRead.version === 1, '读取版本 v1');
+  check(!!oooRead && oooRead.evidence
+    && oooRead.evidence.releaseBy === 'D1'
+    && oooRead.evidence.acquireBy === 'E1'
+    && oooRead.evidence.via
+    && oooRead.evidence.via.kind === 'semaphore'
+    && oooRead.evidence.via.semaphore === 'frame-ready'
+    && oooRead.evidence.via.signalValue === 5
+    && oooRead.evidence.via.waitValue === 4,
+    '完整移交证据：解码释放(D1) + frame-ready 等待(信号5满足等待4) + 编码获取(E1)');
+  const oooTransfer = ooo.json && ooo.json.transfers.find(
+    (t) => t.start === 0 && t.end === 4 && t.evidence.releaseBy === 'D1' && t.evidence.acquireBy === 'E1'
+  );
+  check(!!oooTransfer, '移交记录包含 frame[0..3] 的 D1→E1 完整证据');
+  const c1Write = ooo.json && ooo.json.affectedRanges.C1.writes[0];
+  check(!!c1Write && c1Write.start === 4 && c1Write.end === 8, '校正只写不重叠的后半段 frame[4..7]');
+
+  console.log('[7] 重复目标值必须被拒绝');
+  const dup = await request(base, 'POST', '/api/verify', scenarios.duplicateTarget.input);
+  check(dup.status === 422, `HTTP 422（实际 ${dup.status}）`);
+  check(dup.json && dup.json.ok === false && dup.json.code === 'INVALID_SIGNAL_VALUE',
+    `code=INVALID_SIGNAL_VALUE（实际 ${dup.json && dup.json.code}）`);
+  check(dup.json && dup.json.submissionId === 'C1' && dup.json.firstDeclaredBy === 'D1'
+    && dup.json.signalValue === 3, '定位重复声明提交 C1（D1 已声明 3）');
 
   return failures;
 }

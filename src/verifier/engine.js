@@ -4,8 +4,12 @@
 //
 // 偏序来源：
 //   1. 同一队列内提交按录入顺序先后（队列顺序边）
-//   2. 提交等待时间线信号量值 v：递增到该值的那个 signal 提交必须先于它（信号量边）
-// 拒绝：等待无满足来源（无信号或信号值不足）、偏序成环（死锁）
+//   2. 提交等待时间线信号量值 v：时间线首次达到 >=v 的那次 signal 提交必须先于它（信号量边，可跨队列）
+//   3. 同一时间线的各次 signal 按目标值从小到大严格先后（时间线顺序边，与录入顺序无关）
+// 目标值：signal 可显式声明目标值（允许跳跃，5 可满足等待 4）；同时间线每个值只能被声明
+//         一次（含与自动递增撞值），重复值无法形成严格递增链，不得伪装成有效同步。
+//         未填目标值的 signal 沿用旧行为：按录入顺序自动取“上一信号值 +1”。
+// 拒绝：等待无满足来源（无信号或信号值不足）、重复目标值、偏序成环（死锁）
 // 逐单元维护：owner(属主队列) / version(最新写版本) / pending(待获取移交) / transfer(最近一次完成的移交证据)
 
 // UMD：Node（require）与浏览器 Web Worker（importScripts）共用
@@ -69,30 +73,65 @@ function analyze(input) {
   const n = subs.length;
 
   // ---- 1. 构建时间线信号量的全局递增序列（信号量是单调时间线）----
-  const signalIndexOf = new Map(); // semaphore -> 最近一次记录的时间线值
-  const signalerAt = new Map(); // `${semaphore}:${value}` -> 提交下标
-  const signalValues = new Map(); // semaphore -> 录入过的时间线值
+  // signalEntries: semaphore -> [{ index, value }]（按录入顺序）
+  // 显式目标值允许跳跃（声明 5 可满足等待 4）；缺省值沿用旧行为：取此前最大目标值 +1。
+  const signalEntries = new Map();
+  const declaredValues = new Map(); // semaphore -> 录入顺序的目标值列表（结果展示用）
+  const signalErrors = [];
   subs.forEach((s, i) => {
-    if (s.signal && s.signal.semaphore) {
-      const semaphore = s.signal.semaphore;
-      const value = s.signal.value || ((signalIndexOf.get(semaphore) || 0) + 1);
-      signalIndexOf.set(semaphore, value);
-      signalerAt.set(`${semaphore}:${value}`, i);
-      if (!signalValues.has(semaphore)) signalValues.set(semaphore, []);
-      signalValues.get(semaphore).push(value);
+    if (!s.signal || !s.signal.semaphore) return;
+    const semaphore = s.signal.semaphore;
+    if (!signalEntries.has(semaphore)) signalEntries.set(semaphore, []);
+    const prior = signalEntries.get(semaphore);
+    const maxSoFar = prior.reduce((m, e) => Math.max(m, e.value), 0);
+    const value = s.signal.value || maxSoFar + 1;
+    // 同一时间线的目标值必须互不相同：重复值（含与自动递增撞值）无法构成严格递增链
+    const clash = prior.find((e) => e.value === value);
+    if (clash) {
+      signalErrors.push(
+        err('INVALID_SIGNAL_VALUE', `提交 ${s.id} 对时间线 ${semaphore} 声明目标值 ${value}，但提交 ${subs[clash.index].id} 已声明同一值；同一时间线的目标值必须严格递增、不可重复`, {
+          submissionId: s.id,
+          queue: s.queue,
+          semaphore,
+          signalValue: value,
+          firstDeclaredBy: subs[clash.index].id
+        })
+      );
     }
+    prior.push({ index: i, value });
+    if (!declaredValues.has(semaphore)) declaredValues.set(semaphore, []);
+    declaredValues.get(semaphore).push(value);
   });
+  if (signalErrors.length) return signalErrors[0];
+
+  // 每条时间线按目标值升序排列
+  const sortedSignals = new Map(); // semaphore -> [{ index, value }]（值升序）
+  const maxSignalValue = new Map(); // semaphore -> 最大目标值
+  for (const [semaphore, entries] of signalEntries) {
+    const sorted = [...entries].sort((a, b) => a.value - b.value);
+    sortedSignals.set(semaphore, sorted);
+    maxSignalValue.set(semaphore, sorted[sorted.length - 1].value);
+  }
 
   // ---- 2. 构建偏序 DAG ----
   const edges = Array.from({ length: n }, () => []);
-  const edgeReasons = new Map(); // "a->b" -> 证据
+  const edgeReasons = new Map(); // "a->b" -> [证据, ...]（同一条边可同时由队列/时间线/等待构成）
   const addEdge = (a, b, reason) => {
     if (a === b) return;
     const key = `${a}->${b}`;
     if (!edgeReasons.has(key)) {
       edges[a].push(b);
-      edgeReasons.set(key, reason);
+      edgeReasons.set(key, []);
     }
+    const reasons = edgeReasons.get(key);
+    const sig = JSON.stringify(reason);
+    if (!reasons.some((r) => JSON.stringify(r) === sig)) reasons.push(reason);
+  };
+  // 移交证据优先引用直接的信号量等待边（释放方正是被等到的信号）；否则取任一边或传递关系
+  const viaBetween = (a, b) => {
+    const reasons = edgeReasons.get(`${a}->${b}`);
+    if (reasons) return reasons.find((r) => r.kind === 'semaphore') || reasons[0];
+    return hb(a, b) ? { kind: 'transitive' } : null;
   };
 
   // 2a. 同队列顺序
@@ -105,26 +144,55 @@ function analyze(input) {
     lastByQueue.set(s.queue, i);
   });
 
-  // 2b. 信号量等待：值 v 由第 v 次 signal 满足；时间线信号量可跨队列建立先后关系
+  // 2b. 时间线顺序：同一时间线的各次 signal 按目标值升序严格先后（与录入顺序无关）
+  for (const [semaphore, sorted] of sortedSignals) {
+    for (let k = 1; k < sorted.length; k += 1) {
+      const lo = sorted[k - 1];
+      const hi = sorted[k];
+      addEdge(lo.index, hi.index, {
+        kind: 'timeline-order',
+        semaphore,
+        fromValue: lo.value,
+        toValue: hi.value
+      });
+    }
+  }
+
+  // 2c. 信号量等待：wait >=v 由该时间线上首个目标值 >=v 的 signal 满足（允许跳跃，跨队列）
   const waitErrors = [];
-  subs.forEach((s, i) => {
-    if (!s.wait) return;
+  const waitEdge = (i) => {
+    const s = subs[i];
+    if (!s.wait) return null;
     const { semaphore, value } = s.wait;
-    const signaler = signalerAt.get(`${semaphore}:${value}`);
-    if (signaler === undefined) {
+    const sorted = sortedSignals.get(semaphore);
+    const source = sorted ? sorted.find((e) => e.value >= value) : undefined;
+    if (!source) {
       waitErrors.push(
         err('UNSATISFIED_WAIT', `提交 ${s.id} 等待 ${semaphore}>=${value}，但该时间线从未递增到该值（无满足来源）`, {
           submissionId: s.id,
           queue: s.queue,
           semaphore,
           waitValue: value,
-          available: signalIndexOf.get(semaphore) || 0
+          available: maxSignalValue.get(semaphore) || 0
         })
       );
-      return;
+      return null;
     }
-    addEdge(signaler, i, { kind: 'semaphore', semaphore, signalValue: value, waitValue: value, sourceQueue: subs[signaler].queue });
-  });
+    return {
+      from: source.index,
+      reason: {
+        kind: 'semaphore',
+        semaphore,
+        signalValue: source.value,
+        waitValue: value,
+        sourceQueue: subs[source.index].queue
+      }
+    };
+  };
+  for (let i = 0; i < n; i += 1) {
+    const e = waitEdge(i);
+    if (e) addEdge(e.from, i, e.reason);
+  }
   if (waitErrors.length) return waitErrors[0];
 
   // ---- 3. 环检测（死锁）----
@@ -153,7 +221,7 @@ function analyze(input) {
     const ids = cycleNodes.map((i) => subs[i].id);
     const reasons = [];
     for (let k = 0; k < cycleNodes.length - 1; k += 1) {
-      reasons.push({ from: subs[cycleNodes[k]].id, to: subs[cycleNodes[k + 1]].id, reason: edgeReasons.get(`${cycleNodes[k]}->${cycleNodes[k + 1]}`) });
+      reasons.push({ from: subs[cycleNodes[k]].id, to: subs[cycleNodes[k + 1]].id, reasons: edgeReasons.get(`${cycleNodes[k]}->${cycleNodes[k + 1]}`) });
     }
     const touched = {};
     cycleNodes.slice(0, -1).forEach((i) => {
@@ -276,8 +344,7 @@ function analyze(input) {
               executedPrefix: executed.map((x) => x.id)
             });
           }
-          const via = edgeReasons.get(`${cell.pending.releaseIndex}->${si}`) ||
-            (hb(cell.pending.releaseIndex, si) ? { kind: 'transitive' } : null);
+          const via = viaBetween(cell.pending.releaseIndex, si);
           const evidence = {
             fromQueue: cell.pending.fromQueue,
             toQueue: s.queue,
@@ -384,9 +451,9 @@ function analyze(input) {
     executableOrder: executed,
     affectedRanges,
     transfers: transferSegments,
-    timelines: Object.fromEntries([...signalIndexOf.entries()].map(([k, v]) => [k, {
+    timelines: Object.fromEntries([...maxSignalValue.entries()].map(([k, v]) => [k, {
       signaled: v,
-      declaredValues: signalValues.get(k)
+      declaredValues: declaredValues.get(k)
     }]))
   };
 }

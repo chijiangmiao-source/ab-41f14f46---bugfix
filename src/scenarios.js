@@ -84,6 +84,66 @@ const scenarios = {
         }
       ]
     }
+  },
+
+  // 场景四：乱序录入的显式目标值 —— 解码先录入声明 5，校正后录入声明 3，
+  // 编码等待 frame-ready>=4（跳跃门槛）。必须按目标值确定 校正(3) -> 解码(5) -> 编码，
+  // 且编码对解码区间的读取具备 释放 + 时间线等待 + 获取 的完整移交证据。
+  outOfOrderTargets: {
+    title: '乱序目标值与跳跃门槛（应通过：校正→解码→编码）',
+    input: {
+      queues: ['decode-q', 'correct-q', 'encode-q'],
+      buffers: [{ name: 'frame', length: 8 }],
+      submissions: [
+        {
+          id: 'D1',
+          queue: 'decode-q',
+          signal: { semaphore: 'frame-ready', value: 5 },
+          operations: [
+            { type: 'write', buffer: 'frame', offset: 0, length: 4 },
+            { type: 'release', buffer: 'frame', offset: 0, length: 4 }
+          ]
+        },
+        {
+          id: 'C1',
+          queue: 'correct-q',
+          signal: { semaphore: 'frame-ready', value: 3 },
+          operations: [{ type: 'write', buffer: 'frame', offset: 4, length: 4 }]
+        },
+        {
+          id: 'E1',
+          queue: 'encode-q',
+          wait: { semaphore: 'frame-ready', value: 4 },
+          operations: [
+            { type: 'acquire', buffer: 'frame', offset: 0, length: 4 },
+            { type: 'read', buffer: 'frame', offset: 0, length: 4 }
+          ]
+        }
+      ]
+    }
+  },
+
+  // 场景五：同一时间线重复声明相同目标值 —— 无法形成严格递增链，必须拒绝
+  duplicateTarget: {
+    title: '重复目标值（应拒绝）',
+    input: {
+      queues: ['decode-q', 'correct-q'],
+      buffers: [{ name: 'frame', length: 8 }],
+      submissions: [
+        {
+          id: 'D1',
+          queue: 'decode-q',
+          signal: { semaphore: 'frame-ready', value: 3 },
+          operations: [{ type: 'write', buffer: 'frame', offset: 0, length: 4 }]
+        },
+        {
+          id: 'C1',
+          queue: 'correct-q',
+          signal: { semaphore: 'frame-ready', value: 3 },
+          operations: [{ type: 'write', buffer: 'frame', offset: 4, length: 4 }]
+        }
+      ]
+    }
   }
 };
 
