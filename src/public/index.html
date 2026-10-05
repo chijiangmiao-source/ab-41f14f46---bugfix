@@ -61,6 +61,9 @@
         <button class="ghost" data-scn="missingAcquire">缺少获取的跨队列读取（应拒绝）</button>
         <button class="ghost" data-scn="completeTransfer">完整移交后读取（应通过）</button>
         <button class="ghost" data-scn="deadlock">死锁环（应拒绝）</button>
+        <button class="ghost" data-scn="outOfOrderTargets">乱序目标值 3/5（应通过）</button>
+        <button class="ghost" data-scn="jumpThreshold">跳跃门槛 5→等待4（应通过）</button>
+        <button class="ghost" data-scn="duplicateTarget">重复目标值（应拒绝）</button>
       </div>
     </div>
 
@@ -215,6 +218,7 @@ function renderSubmissions() {
     const sSem = document.createElement('input'); sSem.placeholder = '信号量名'; sSem.value = s.signal ? s.signal.semaphore : '';
     const sVal = document.createElement('input'); sVal.type = 'number'; sVal.min = 1;
     sVal.placeholder = '目标值（可选）'; sVal.value = s.signal && s.signal.value ? s.signal.value : '';
+    sVal.title = '可跳跃、可乱序录入；同一时间线的目标值必须互不相同且按值严格递增执行';
     const applySignal = () => {
       const semaphore = sSem.value.trim();
       if (!semaphore) { s.signal = null; return; }
@@ -224,6 +228,7 @@ function renderSubmissions() {
     sSem.oninput = applySignal; sVal.oninput = applySignal;
     sync.append(sSem, sVal);
     card.append(sync);
+    card.append(el('div', 'muted', '目标值可跳跃（声明 5 可满足等待 4）、可乱序录入；留空则沿用按录入顺序递增 1,2,3…，同时间线目标值重复将被拒绝。'));
 
     renderOps(card, s);
     box.append(card);
@@ -333,6 +338,9 @@ function renderResult(box, r) {
     if (r.currentOwner !== undefined) dl.push(['当前属主', r.currentOwner || '无']);
     if (r.expectedVersion !== undefined) dl.push(['版本', `读取到 v${r.observedVersion}，当前应为 v${r.expectedVersion}`]);
     if (r.cycle) dl.push(['死锁环', r.cycle.join(' → ')]);
+    if (r.semaphore) dl.push(['时间线', r.semaphore]);
+    if (r.signalValue !== undefined) dl.push(['冲突/信号目标值', r.signalValue]);
+    if (Array.isArray(r.submissionIds)) dl.push(['相关提交', r.submissionIds.join('、')]);
     if (r.executedPrefix && r.executedPrefix.length) dl.push(['已执行前缀', r.executedPrefix.join(' → ')]);
     const table = document.createElement('table');
     dl.forEach(([k, v]) => {

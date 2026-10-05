@@ -53,6 +53,8 @@ async function runChecks(base) {
   const scn = await request(base, 'GET', '/api/scenarios');
   check(scn.status === 200 && scn.json && scn.json.missingAcquire && scn.json.completeTransfer,
     '返回 missingAcquire 与 completeTransfer 两个场景');
+  check(!!(scn.json && scn.json.outOfOrderTargets && scn.json.jumpThreshold && scn.json.duplicateTarget),
+    '返回乱序目标值、跳跃门槛、重复目标值三个新场景');
 
   console.log('[3b] Worker 引擎静态资源 GET /verifier/worker.js');
   const wjs = await request(base, 'GET', '/verifier/worker.js');
@@ -82,6 +84,51 @@ async function runChecks(base) {
     && read.evidence.via && read.evidence.via.kind === 'semaphore',
     '呈现完整移交证据（releaseBy=D1, acquireBy=E1, via=semaphore）');
   check(!!(good.json && good.json.transfers.length === 1), '移交记录 1 段 frameA[0..7]');
+
+  console.log('[6] “乱序目标值”必须通过：校正→解码→编码，编码读取携带完整移交证据');
+  const ooo = await request(base, 'POST', '/api/verify', scenarios.outOfOrderTargets.input);
+  check(ooo.status === 200, `HTTP 200（实际 ${ooo.status}）`);
+  check(ooo.json && ooo.json.ok === true, 'ok=true');
+  const oooOrder = ooo.json && ooo.json.executableOrder.map((x) => x.id).join(',');
+  check(oooOrder === 'C1,D1,E1', `可执行次序 校正(C1) → 解码(D1) → 编码(E1)（实际 ${oooOrder}）`);
+  const oooRead = ooo.json && ooo.json.affectedRanges.E1.reads[0];
+  check(!!oooRead && oooRead.start === 0 && oooRead.end === 8, '编码读取解码区间 frame[0..7]');
+  check(!!oooRead && oooRead.version === 1, '读取版本 v1');
+  check(!!oooRead && oooRead.evidence
+    && oooRead.evidence.releaseBy === 'D1'
+    && oooRead.evidence.acquireBy === 'E1'
+    && oooRead.evidence.fromQueue === 'decode-q'
+    && oooRead.evidence.toQueue === 'encode-q'
+    && oooRead.evidence.via
+    && oooRead.evidence.via.kind === 'semaphore'
+    && oooRead.evidence.via.semaphore === 'frame-ready'
+    && oooRead.evidence.via.signalValue === 5
+    && oooRead.evidence.via.waitValue === 4,
+    '完整移交证据（D1 释放、frame-ready 等待由声明 5 满足、E1 获取）');
+  check(!!(ooo.json && ooo.json.transfers.length === 1
+    && ooo.json.transfers[0].start === 0 && ooo.json.transfers[0].end === 8),
+    '移交记录 1 段 frame[0..7]');
+
+  console.log('[7] “跳跃门槛”：声明 5 满足等待 4，必须通过');
+  const jump = await request(base, 'POST', '/api/verify', scenarios.jumpThreshold.input);
+  check(jump.status === 200, `HTTP 200（实际 ${jump.status}）`);
+  check(jump.json && jump.json.ok === true, 'ok=true');
+  const jumpOrder = jump.json && jump.json.executableOrder.map((x) => x.id).join(',');
+  check(jumpOrder === 'D1,E1', `可执行次序 D1 → E1（实际 ${jumpOrder}）`);
+  const jumpVia = jump.json && jump.json.affectedRanges.E1.reads[0].evidence.via;
+  check(!!jumpVia && jumpVia.signalValue === 5 && jumpVia.waitValue === 4,
+    '满足来源为声明值 5（非恰好 4），等待门槛 4 被跳跃满足');
+
+  console.log('[8] “重复目标值”必须被拒绝');
+  const dup = await request(base, 'POST', '/api/verify', scenarios.duplicateTarget.input);
+  check(dup.status === 422, `HTTP 422（实际 ${dup.status}）`);
+  check(dup.json && dup.json.ok === false && dup.json.code === 'SIGNAL_VALUE_CONFLICT',
+    `code=SIGNAL_VALUE_CONFLICT（实际 ${dup.json && dup.json.code}）`);
+  check(dup.json && dup.json.semaphore === 'frame-ready' && dup.json.signalValue === 5,
+    '定位时间线 frame-ready 与重复目标值 5');
+  check(dup.json && Array.isArray(dup.json.submissionIds)
+    && dup.json.submissionIds.includes('D1') && dup.json.submissionIds.includes('C1'),
+    '定位重复声明该值的提交 D1、C1');
 
   return failures;
 }

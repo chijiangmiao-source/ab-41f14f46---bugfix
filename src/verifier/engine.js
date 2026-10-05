@@ -4,8 +4,9 @@
 //
 // 偏序来源：
 //   1. 同一队列内提交按录入顺序先后（队列顺序边）
-//   2. 提交等待时间线信号量值 v：递增到该值的那个 signal 提交必须先于它（信号量边）
-// 拒绝：等待无满足来源（无信号或信号值不足）、偏序成环（死锁）
+//   2. 提交等待时间线信号量值 v：任何把该时间线提升到 >=v 的 signal 提交都必须先于它（信号量边，允许跳跃）
+//   3. 同一时间线的显式目标值本身也要按值严格递增地执行（目标值先后边，如乱序录入的 3 先于 5）
+// 拒绝：等待无满足来源、目标值重复（无法形成严格递增）、偏序成环（死锁）
 // 逐单元维护：owner(属主队列) / version(最新写版本) / pending(待获取移交) / transfer(最近一次完成的移交证据)
 
 // UMD：Node（require）与浏览器 Web Worker（importScripts）共用
@@ -69,19 +70,71 @@ function analyze(input) {
   const n = subs.length;
 
   // ---- 1. 构建时间线信号量的全局递增序列（信号量是单调时间线）----
-  const signalIndexOf = new Map(); // semaphore -> 最近一次记录的时间线值
-  const signalerAt = new Map(); // `${semaphore}:${value}` -> 提交下标
-  const signalValues = new Map(); // semaphore -> 录入过的时间线值
+  // 未填写目标值的 signal 沿用既有递增录入行为：按录入顺序取 1,2,3…（计数器）。
+  // 显式目标值允许跳跃、允许先录大值再录小值；同一时间线上显式值必须互不相同，
+  // 它们构成唯一的严格递增链（3 的提交必须先于 5 的提交），重复值无法排序将被拒绝。
+  const signalRecords = new Map(); // semaphore -> [{ index, value, explicit }]
   subs.forEach((s, i) => {
-    if (s.signal && s.signal.semaphore) {
-      const semaphore = s.signal.semaphore;
-      const value = s.signal.value || ((signalIndexOf.get(semaphore) || 0) + 1);
-      signalIndexOf.set(semaphore, value);
-      signalerAt.set(`${semaphore}:${value}`, i);
-      if (!signalValues.has(semaphore)) signalValues.set(semaphore, []);
-      signalValues.get(semaphore).push(value);
-    }
+    if (!s.signal || !s.signal.semaphore) return;
+    const semaphore = s.signal.semaphore;
+    if (!signalRecords.has(semaphore)) signalRecords.set(semaphore, []);
+    signalRecords.get(semaphore).push({
+      index: i,
+      value: s.signal.value === undefined || s.signal.value === null ? null : s.signal.value,
+      explicit: !(s.signal.value === undefined || s.signal.value === null)
+    });
   });
+
+  const explicitValues = new Map(); // semaphore -> Map(value -> 提交下标)
+  const declaredValues = new Map(); // semaphore -> 实际出现过的时间线值
+  const declaredBySemaphore = new Map(); // semaphore -> [{ value, idx }]（按值升序）
+  const explicitOnly = new Map(); // semaphore -> 是否仅有显式 signal
+
+  for (const [semaphore, records] of signalRecords) {
+    const implicitRecords = records.filter((r) => !r.explicit);
+    const explicitRecords = records.filter((r) => r.explicit);
+    const hasImplicit = implicitRecords.length > 0;
+    explicitOnly.set(semaphore, !hasImplicit && explicitRecords.length > 0);
+
+    // 未填目标值的既有录入：按录入顺序赋 1,2,3…
+    let implicitCounter = 0;
+    const resolved = records.map((r) => {
+      const value = r.explicit ? r.value : (implicitCounter += 1);
+      return { ...r, value };
+    });
+
+    // 目标值重复（显式与显式，或显式与隐式计数撞值）：
+    // 同一时间线无法就该值形成严格递增的执行先后，不能伪装成有效同步
+    const ownerByValue = new Map();
+    for (const r of resolved) {
+      if (ownerByValue.has(r.value)) {
+        const a = subs[ownerByValue.get(r.value)];
+        const b = subs[r.index];
+        return err(
+          'SIGNAL_VALUE_CONFLICT',
+          `时间线 ${semaphore} 的目标值 ${r.value} 被多个提交重复声明（${a.id}、${b.id}），无法形成严格递增的执行先后`,
+          {
+            semaphore,
+            signalValue: r.value,
+            submissionIds: [a.id, b.id],
+            declaredValues: resolved.map((x) => x.value)
+          }
+        );
+      }
+      ownerByValue.set(r.value, r.index);
+    }
+
+    declaredValues.set(semaphore, resolved.map((r) => r.value));
+    declaredBySemaphore.set(
+      semaphore,
+      resolved.map((r) => ({ value: r.value, idx: r.index })).sort((a, b) => a.value - b.value)
+    );
+    if (!hasImplicit) {
+      const byValue = new Map();
+      explicitRecords.forEach((r) => byValue.set(r.value, r.index));
+      explicitValues.set(semaphore, byValue);
+    }
+  }
 
   // ---- 2. 构建偏序 DAG ----
   const edges = Array.from({ length: n }, () => []);
@@ -105,25 +158,48 @@ function analyze(input) {
     lastByQueue.set(s.queue, i);
   });
 
-  // 2b. 信号量等待：值 v 由第 v 次 signal 满足；时间线信号量可跨队列建立先后关系
+  // 2b. 显式目标值链：同一时间线的提交必须严格按目标值递增执行（乱序录入也建立该先后）
+  for (const [semaphore, byValue] of explicitValues) {
+    if (explicitOnly.get(semaphore) !== true) continue; // 与隐式递增混用时不加链，保持既有行为
+    const vals = [...byValue.keys()].sort((a, b) => a - b);
+    for (let k = 1; k < vals.length; k += 1) {
+      addEdge(byValue.get(vals[k - 1]), byValue.get(vals[k]), {
+        kind: 'timeline-target',
+        semaphore,
+        fromValue: vals[k - 1],
+        toValue: vals[k]
+      });
+    }
+  }
+
+  // 2c. 信号量等待：任何声明值 >= 等待值的 signal 都可满足（允许跳跃，如声明 5 满足等待 4），
+  // 取其中最小的声明值作为满足来源；时间线信号量可跨队列建立先后关系
   const waitErrors = [];
   subs.forEach((s, i) => {
     if (!s.wait) return;
     const { semaphore, value } = s.wait;
-    const signaler = signalerAt.get(`${semaphore}:${value}`);
-    if (signaler === undefined) {
+    const candidates = declaredBySemaphore.get(semaphore);
+    const source = candidates && candidates.find((c) => c.value >= value);
+    if (!source) {
+      const available = candidates ? candidates[candidates.length - 1].value : 0;
       waitErrors.push(
         err('UNSATISFIED_WAIT', `提交 ${s.id} 等待 ${semaphore}>=${value}，但该时间线从未递增到该值（无满足来源）`, {
           submissionId: s.id,
           queue: s.queue,
           semaphore,
           waitValue: value,
-          available: signalIndexOf.get(semaphore) || 0
+          available
         })
       );
       return;
     }
-    addEdge(signaler, i, { kind: 'semaphore', semaphore, signalValue: value, waitValue: value, sourceQueue: subs[signaler].queue });
+    addEdge(source.idx, i, {
+      kind: 'semaphore',
+      semaphore,
+      signalValue: source.value,
+      waitValue: value,
+      sourceQueue: subs[source.idx].queue
+    });
   });
   if (waitErrors.length) return waitErrors[0];
 
@@ -379,15 +455,20 @@ function analyze(input) {
     }))
   );
 
+  const timelines = {};
+  for (const [semaphore, list] of declaredBySemaphore) {
+    timelines[semaphore] = {
+      signaled: list.length ? list[list.length - 1].value : 0,
+      declaredValues: (declaredValues.get(semaphore) || []).slice()
+    };
+  }
+
   return {
     ok: true,
     executableOrder: executed,
     affectedRanges,
     transfers: transferSegments,
-    timelines: Object.fromEntries([...signalIndexOf.entries()].map(([k, v]) => [k, {
-      signaled: v,
-      declaredValues: signalValues.get(k)
-    }]))
+    timelines
   };
 }
 

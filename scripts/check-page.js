@@ -22,6 +22,9 @@ function run() {
   check(/\/api\/scenarios/.test(html), '未接入 /api/scenarios');
   check(/缺少获取的跨队列读取/.test(html), '缺少标准场景一入口');
   check(/完整移交后读取/.test(html), '缺少标准场景二入口');
+  check(/data-scn="outOfOrderTargets"/.test(html), '缺少乱序目标值场景入口');
+  check(/data-scn="jumpThreshold"/.test(html), '缺少跳跃门槛场景入口');
+  check(/data-scn="duplicateTarget"/.test(html), '缺少重复目标值场景入口');
   check(/MAX_BUFFER_LEN:\s*64/.test(html), '未体现 64 单元上限');
   check(/MAX_SUBMISSIONS:\s*48/.test(html), '未体现 48 提交上限');
   check(/MAX_QUEUES:\s*3/.test(html), '未体现 3 队列上限');

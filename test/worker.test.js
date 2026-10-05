@@ -43,4 +43,19 @@ test('Worker 入口在 Worker 全局中完成偏序复核并回传结果', () =>
   // 结果来自独立 VM realm，用 JSON 做结构化比较
   assert.deepEqual(JSON.parse(JSON.stringify(messages[1].executableOrder.map((x) => x.id))), ['D1', 'E1']);
   assert.equal(messages[1].affectedRanges.E1.reads[0].evidence.acquireBy, 'E1');
+
+  // 乱序目标值场景在 Worker 中同样得到 校正→解码→编码 的次序与完整移交证据
+  sandbox.self.onmessage({ data: { input: scenarios.outOfOrderTargets.input } });
+  assert.equal(messages.length, 3);
+  assert.equal(messages[2].ok, true, JSON.stringify(messages[2]));
+  assert.deepEqual(JSON.parse(JSON.stringify(messages[2].executableOrder.map((x) => x.id))), ['C1', 'D1', 'E1']);
+  const via = messages[2].affectedRanges.E1.reads[0].evidence.via;
+  assert.equal(via.signalValue, 5);
+  assert.equal(via.waitValue, 4);
+
+  // 重复目标值在 Worker 中同样被拒绝
+  sandbox.self.onmessage({ data: { input: scenarios.duplicateTarget.input } });
+  assert.equal(messages.length, 4);
+  assert.equal(messages[3].ok, false);
+  assert.equal(messages[3].code, 'SIGNAL_VALUE_CONFLICT');
 });
